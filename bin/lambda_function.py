@@ -463,7 +463,7 @@ def line_event_handler(event):
                       fb.update_tbl_heart(),
                       fb.update_tbl_activities())
         prediction = model.predict()
-        message("{}\n[指標:{}]".format(prediction[1],prediction[0]))
+        message = "{}\n[指標:{}]".format(prediction[1],prediction[0])
     
     line_push(user_id, message)
 
