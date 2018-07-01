@@ -19,7 +19,6 @@ import urllib
 import datetime
 import decimal
 
-
 AWS_BOTO3_ACCESS_KEY = os.environ["AWS_BOTO3_ACCESS_KEY"]
 AWS_BOTO3_SECRET_KEY = os.environ["AWS_BOTO3_SECRET_KEY"]
 AWS_REGION = "ap-northeast-1"
@@ -133,7 +132,21 @@ class DynamoDB:
             log_error(4, "RequestId:{}".format(request_id))
 
         logger.info("[DYNAMO_UPDATE]:{{tbl:m_user,line_mid:{},context_id:{}}}".format(line_mid, context_id))
+   
+
+    def scan_m_user(self):        
+        self.__connect_if_not()        
+        table = self.con.Table("m_user")
         
+        res = table.scan()
+        
+        items = res["Items"]
+        line_mids = [item["line_mid"] for item in items]        
+        
+        logger.info("[DYNAMO_SCAN]:{{tbl:m_user,line_mids:{}}}".format(line_mids))
+        
+        return items
+
 
 class ExFitbit(fitbit.Fitbit):
     
@@ -295,7 +308,7 @@ class FitbitAuthController:
             return False
 
         self.register(content)
-        text = "Fitbitと連携できたよ！"
+        text = "Fitbitと連携できたよ！「おつげ」って呼びかけてみてね。"
         line_push(self.line_mid, text)
         return True
         
@@ -443,8 +456,8 @@ def event_handler(event):
     # from CloudWatch
     cloud_watch_event = event.get("CloudWatchEvent")
     if cloud_watch_event:
-        # Todo
-        pass
+        predict_all()
+        return
     
     # from Line Post
     events = event.get("events")
@@ -463,6 +476,14 @@ def event_handler(event):
             
         fb_auth.handle_code(event.get("code"))
         return
+
+
+def predict_all():
+    
+    m_users = dynamo.scan_m_user()
+    
+    for m_user in m_users:
+        predict(m_user)
 
 
 def line_event_handler(event):
@@ -485,24 +506,29 @@ def line_event_handler(event):
     
     # TODO
     if "おつげ" in in_message:
-        fb = ExFitbit(m_user)
-        model = Model(fb.update_tbl_sleep(),
-                      fb.update_tbl_heart(),
-                      fb.update_tbl_activities(),
-                      datetime.datetime.strftime(DATETIME_NOW, "%Y-%m-%d"))
-        prediction = model.predict()
-        out_message = "{}\n[指標:{}]".format(prediction[1],prediction[0])
-        line_push(user_id, out_message)
-        
-        if not model.is_latest:
-            out_message = "ちなみに予測元データの日付は{}だよ。\n最新データにするにはFitbitアプリでデータ同期をしてから、もう一度「おつげ」と声をかけてね。".format(model.base_date_str)
-            line_push(user_id, out_message)
-        return    
+        predict(m_user)
+        return
             
     if in_message:
         out_message = docomo_talk(in_message, user_id, m_user.get("context_id"))
         line_push(user_id, out_message)
         return        
+
+def predict(m_user):
+    
+    fb = ExFitbit(m_user)
+    model = Model(fb.update_tbl_sleep(),
+                  fb.update_tbl_heart(),
+                  fb.update_tbl_activities(),
+                  datetime.datetime.strftime(DATETIME_NOW, "%Y-%m-%d"))
+    prediction = model.predict()
+    out_message = "{}\n[指標:{}]".format(prediction[1],prediction[0])
+    line_push(m_user["line_mid"], out_message)
+    
+    if not model.is_latest:
+        out_message = "ちなみに予測元データの日付は{}だよ。\n最新データにするにはFitbitアプリでデータ同期をしてから、もう一度「おつげ」と声をかけてね。".format(model.base_date_str)
+        line_push(m_user["line_mid"], out_message)
+
 
 def docomo_talk(in_message, line_mid, context_id):
 
