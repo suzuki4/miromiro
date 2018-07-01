@@ -37,6 +37,9 @@ FITBIT_REDIRECT_URI = "https://0knbiipk1h.execute-api.ap-northeast-1.amazonaws.c
 FITBIT_SCOPES = "activity heartrate location nutrition profile settings sleep social weight"
 FITBIT_AUTH_URL = "https://www.fitbit.com/oauth2/authorize?response_type=code&client_id={}&redirect_uri={}&scope={}&expires_in=3600000".format(FITBIT_CLIENT_ID,urllib.parse.quote(FITBIT_REDIRECT_URI),urllib.parse.quote(FITBIT_SCOPES))
 
+DOCOMO_APIKEY = os.environ["DOCOMO_APIKEY"]
+DOCOMO_ENDPOINT = "https://api.apigw.smt.docomo.ne.jp/dialogue/v1/dialogue?APIKEY={}".format(DOCOMO_APIKEY)
+
 DATETIME_NOW = datetime.datetime.now()
 BASE_PERIOD = 100
 
@@ -47,14 +50,15 @@ class Error:
     ERRORS = {1:"Fitbit連携時に拒否以外のerror",
               2:"Fitbit連携時にエラーはないがcodeがNone",
               3:"Fitbit連携時にauth_requestの結果がNone",
+              4:"DynamoUpdate時にステータスコード200以外"
              }    
 
     @classmethod
     def code(cls, code):
         return cls.ERRORS[code]
 
-def log_error(error_code):
-    logger.error("[ERROR_CODE_{0:04d}]:{}".format(error_code, Error.code(error_code)))
+def log_error(error_code, option=""):
+    logger.error("[ERROR_CODE_{0:04d}]:{1} {2}".format(error_code, Error.code(error_code), option))
 
 ##############################
 
@@ -108,7 +112,28 @@ class DynamoDB:
         logger.info("[DYNAMO_QUERY]:{{tbl:{},line_mid:{},{}:{},result_cnt:{}}}".format(table_name, line_mid, datetime_key, datetime_str, len(items)))
 
         return items
- 
+        
+    def update_context_id(self, line_mid, context_id):
+        self.__connect_if_not()        
+        table = self.con.Table("m_user")
+        
+        res = table.update_item(
+            Key={"line_mid": line_mid},
+            UpdateExpression="set context_id = :c",
+            ExpressionAttributeValues={
+                    ":c": context_id
+            },
+            ReturnValues="UPDATED_NEW"
+        )
+        
+        status_code = res["ResponseMetadata"]["HTTPStatusCode"]
+        request_id = res["ResponseMetadata"]["RequestId"]
+
+        if status_code != 200:
+            log_error(4, "RequestId:{}".format(request_id))
+
+        logger.info("[DYNAMO_UPDATE]:{{tbl:m_user,line_mid:{},context_id:{}}}".format(line_mid, context_id))
+        
 
 class ExFitbit(fitbit.Fitbit):
     
@@ -301,7 +326,6 @@ class FitbitAuthController:
                   "refresh_token":content["refresh_token"],
                   "scope":content["scope"],
                   "expires_in":content["expires_in"],
-                  "expires_at":content["expires_at"],
                   }
         dynamo.put_user(m_user)
 
@@ -358,7 +382,8 @@ class Model:
 "4141":"ここ何日かいつもと違うペースですね。旅行とかですか？いつもやっていることも新鮮な気持ちでみてみよう。疲れまだ残っているみたいなので回復もしてね"
 }
     
-    def __init__(self, tbl_sleep, tbl_heart, tbl_activities):
+    def __init__(self, tbl_sleep, tbl_heart, tbl_activities,
+                 date_str=datetime.datetime.strftime(datetime.datetime.now(),"%Y-%m-%d")):
 
         df_sleep = self.__group_df_sleep_by_date(pd.DataFrame(tbl_sleep))
         df_heart = pd.DataFrame(tbl_heart)
@@ -366,6 +391,8 @@ class Model:
         df = df_sleep.merge(df_heart, on=["line_mid", "dateTime"])
         df = df.merge(df_activities, on=["line_mid", "dateTime"])
         self.df = df
+        self.base_date_str = df["dateTime"].max()
+        self.is_latest = self.base_date_str == date_str
 
     def __group_df_sleep_by_date(self, df):
         keys = ["line_mid","dateOfSleep"]
@@ -448,25 +475,50 @@ def line_event_handler(event):
         return
         
     user_id = event["source"]["userId"]
-    message = event["message"]["text"]
+    in_message = event["message"]["text"]
     
     m_user = dynamo.get_m_user(user_id)
     if not m_user:
-        text = "未登録の人は以下のURLからFitbit連携してね。\n\n{}&state={}".format(FITBIT_AUTH_URL, user_id)
-        line_push(user_id, text)
+        out_message = "未登録の人は以下のURLからFitbit連携してね。\n\n{}&state={}".format(FITBIT_AUTH_URL, user_id)
+        line_push(user_id, out_message)
         return
     
     # TODO
-    if "おつげちゃん！" in message:
+    if "おつげ" in in_message:
         fb = ExFitbit(m_user)
         model = Model(fb.update_tbl_sleep(),
                       fb.update_tbl_heart(),
-                      fb.update_tbl_activities())
+                      fb.update_tbl_activities(),
+                      datetime.datetime.strftime(DATETIME_NOW, "%Y-%m-%d"))
         prediction = model.predict()
-        message = "{}\n[指標:{}]".format(prediction[1],prediction[0])
-    
-    line_push(user_id, message)
+        out_message = "{}\n[指標:{}]".format(prediction[1],prediction[0])
+        line_push(user_id, out_message)
+        
+        if not model.is_latest:
+            out_message = "ちなみに予測元データの日付は{}だよ。\n最新データにするにはFitbitアプリでデータ同期をしてから、もう一度「おつげ」と声をかけてね。".format(model.base_date_str)
+            line_push(user_id, out_message)
+        return    
+            
+    if in_message:
+        out_message = docomo_talk(in_message, user_id, m_user.get("context_id"))
+        line_push(user_id, out_message)
+        return        
 
+def docomo_talk(in_message, line_mid, context_id):
+
+   payload = {"utt" : in_message, "context": context_id if context_id else ""}
+   headers = {"Content-type": "application/json"}
+   
+   res = requests.post(DOCOMO_ENDPOINT, data=json.dumps(payload), headers=headers)
+   data = res.json()
+
+   new_context_id = data["context"]
+   out_message = data["utt"]
+   
+   dynamo.update_context_id(line_mid, new_context_id)
+   
+   return out_message
+        
     
 def line_create_message_data(text):
     
@@ -479,20 +531,20 @@ def line_create_message_data(text):
         ]
     }
       
-def line_reply(token, text):
+def line_reply(token, message):
     
-    logger.info("[LINE_REPLY]:{}".format(text))
-    data = line_create_message_data(text)
+    logger.info("[LINE_REPLY]:{}".format(message))
+    data = line_create_message_data(message)
     data["replyToken"] = token
     requests.post(LINE_URL_REPLY, data=json.dumps(data), headers=LINE_HEADERS)
 
-def line_push(to, text):
+def line_push(to, message):    
     
-    logger.info("[LINE_PUSH]:{{to:{},text:{}}}".format(to, text))
-    data = line_create_message_data(text)
+    logger.info("[LINE_PUSH]:{{to:{},message:{}}}".format(to, message))
+    data = line_create_message_data(message)
     data["to"] = to
     requests.post(LINE_URL_PUSH, data=json.dumps(data), headers=LINE_HEADERS)
-
+    
 def convert_to_decimal(dict_):
     return json.loads(json.dumps(dict_), parse_float=decimal.Decimal)
 
