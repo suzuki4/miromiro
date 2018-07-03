@@ -37,7 +37,8 @@ FITBIT_SCOPES = "activity heartrate location nutrition profile settings sleep so
 FITBIT_AUTH_URL = "https://www.fitbit.com/oauth2/authorize?response_type=code&client_id={}&redirect_uri={}&scope={}&expires_in=3600000".format(FITBIT_CLIENT_ID,urllib.parse.quote(FITBIT_REDIRECT_URI),urllib.parse.quote(FITBIT_SCOPES))
 
 DOCOMO_APIKEY = os.environ["DOCOMO_APIKEY"]
-DOCOMO_ENDPOINT = "https://api.apigw.smt.docomo.ne.jp/dialogue/v1/dialogue?APIKEY={}".format(DOCOMO_APIKEY)
+DOCOMO_CHAT_ENDPOINT = "https://api.apigw.smt.docomo.ne.jp/naturalChatting/v1/dialogue?APIKEY={}".format(DOCOMO_APIKEY)
+DOCOMO_REGISTER_ENDPOINT = "https://api.apigw.smt.docomo.ne.jp/naturalChatting/v1/registration?APIKEY={}".format(DOCOMO_APIKEY)
 
 DATETIME_NOW = datetime.datetime.now()
 BASE_PERIOD = 100
@@ -60,6 +61,56 @@ def log_error(error_code, option=""):
     logger.error("[ERROR_CODE_{0:04d}]:{1} {2}".format(error_code, Error.code(error_code), option))
 
 ##############################
+
+class Docomo:    
+    
+    def __init__(self, m_user):
+        self.m_user = m_user
+        self.__set_docomo_id()
+        
+    def __set_docomo_id(self):
+
+        if "docomo_id" in self.m_user:
+            self.docomo_id = self.m_user["docomo_id"]
+        else:
+            self.docomo_id = self.register_docomo_id()
+        
+    def register_docomo_id(self):
+        
+        headers = {"Content-type": "application/json"}
+        payload = {"botId":"Chatting", "appKind":"Smart Phone"}
+           
+        res = requests.post(DOCOMO_REGISTER_ENDPOINT, data=json.dumps(payload), headers=headers)
+        data = res.json()
+
+        docomo_id = data["appId"]   
+        dynamo.update(self.m_user["line_mid"], "m_user", "docomo_id", docomo_id)
+       
+        return docomo_id
+        
+    def chat(self, text):
+
+        if "docomo_send_time" in self.m_user:
+            docomo_recv_time = self.m_user["docomo_send_time"]
+        else:
+            docomo_recv_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        docomo_send_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        headers = {"Content-type": "application/json"}
+        payload = {"language":"ja-JP","botId":"Chatting","appId":self.docomo_id,
+                   "voiceText":text,"appRecvTime":docomo_recv_time,
+                   "appSendTime":docomo_send_time}
+           
+        res = requests.post(DOCOMO_CHAT_ENDPOINT, data=json.dumps(payload), headers=headers)
+        data = res.json()
+        
+        docomo_send_time = data["serverSendTime"]
+        system_text = data["systemText"]["utterance"]
+        
+        dynamo.update(self.m_user["line_mid"], "m_user", "docomo_send_time", docomo_send_time)
+       
+        return system_text     
+      
 
 class DynamoDB:
     
@@ -112,15 +163,15 @@ class DynamoDB:
 
         return items
         
-    def update_context_id(self, line_mid, context_id):
+    def update(self, line_mid, table, key, value):
         self.__connect_if_not()        
-        table = self.con.Table("m_user")
+        table = self.con.Table(table)
         
         res = table.update_item(
             Key={"line_mid": line_mid},
-            UpdateExpression="set context_id = :c",
+            UpdateExpression="set {} = :c".format(key),
             ExpressionAttributeValues={
-                    ":c": context_id
+                    ":c": value
             },
             ReturnValues="UPDATED_NEW"
         )
@@ -131,8 +182,8 @@ class DynamoDB:
         if status_code != 200:
             log_error(4, "RequestId:{}".format(request_id))
 
-        logger.info("[DYNAMO_UPDATE]:{{tbl:m_user,line_mid:{},context_id:{}}}".format(line_mid, context_id))
-   
+        logger.info("[DYNAMO_UPDATE]:{{tbl:{},line_mid:{},{}:{}}}".format(table, line_mid, key, value))
+
 
     def scan_m_user(self):        
         self.__connect_if_not()        
@@ -159,11 +210,12 @@ class ExFitbit(fitbit.Fitbit):
                          refresh_token=m_user["refresh_token"],
                          refresh_cb=self.refresh_cb)
         self.m_user = m_user
+        self.client.refresh_token()
         
     def refresh_cb(self, token):
         logger.info("[FITBIT]:refresh token {}".format(self.m_user["line_mid"]))
         FitbitAuthController(self.m_user["line_mid"]).register(token)
-
+        
     def get_tbl_sleep(self):        
         query_datetime = DATETIME_NOW.replace(hour=0, minute=0, second=0, microsecond=0) - datetime.timedelta(days=BASE_PERIOD)
         return dynamo.query_by_datetime(self.m_user["line_mid"], "tbl_sleep", "endTime", query_datetime.strftime("%Y-%m-%dT00:00:00.000"))
@@ -510,7 +562,8 @@ def line_event_handler(event):
         return
             
     if in_message:
-        out_message = docomo_talk(in_message, user_id, m_user.get("context_id"))
+        docomo = Docomo(m_user)
+        out_message = docomo.chat(in_message)        
         line_push(user_id, out_message)
         return        
 
@@ -528,24 +581,8 @@ def predict(m_user):
     if not model.is_latest:
         out_message = "ちなみに予測元データの日付は{}だよ。\n最新データにするにはFitbitアプリでデータ同期をしてから、もう一度「おつげ」と声をかけてね。".format(model.base_date_str)
         line_push(m_user["line_mid"], out_message)
-
-
-def docomo_talk(in_message, line_mid, context_id):
-
-   payload = {"utt" : in_message, "context": context_id if context_id else ""}
-   headers = {"Content-type": "application/json"}
-   
-   res = requests.post(DOCOMO_ENDPOINT, data=json.dumps(payload), headers=headers)
-   data = res.json()
-
-   new_context_id = data["context"]
-   out_message = data["utt"]
-   
-   dynamo.update_context_id(line_mid, new_context_id)
-   
-   return out_message
         
-    
+        
 def line_create_message_data(text):
     
     return {
